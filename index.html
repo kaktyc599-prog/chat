@@ -1,0 +1,576 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <title>OBS Chat Overlay (splicer_irl) — Emotes & Badges</title>
+
+    <!--
+        ЧАТ ДЛЯ OBS
+        ─────────────────────────────────────────────────────────────
+        Что где менять:
+        • Канал, лимит сообщений и время исчезновения — блок «НАСТРОЙКИ» в скрипте.
+        • Цвета, размеры и скругления — блок «:root» в начале стилей.
+        • Чтобы сообщения не исчезали по времени — messageLifetimeSeconds = 0.
+    -->
+
+    <style>
+        /* ============================================================
+           НАСТРОЙКИ ВНЕШНЕГО ВИДА
+           Меняйте значения — всё остальное подстроится само.
+           ============================================================ */
+        :root {
+            --accent: #9147ff;       /* запасной цвет полоски у сообщения */
+            --badge-size: 20px;      /* размер значков (модератор, саб и т.д.) */
+            --emote-height: 30px;    /* высота смайлов */
+            --msg-radius: 10px;      /* скругление плашек сообщений */
+            --msg-font-size: 18px;   /* размер текста в чате */
+            --chat-gap: 7px;         /* расстояние между сообщениями */
+        }
+
+        /* Сбрасываем отступы браузера, чтобы оверлей занимал ровно свой размер */
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        html, body { width: 100%; height: 100%; }
+
+        /* Прозрачный фон — в OBS будет видна игра за чатом */
+        body {
+            background: transparent;
+            color: #fff;
+            font-family: 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Segoe UI Emoji', sans-serif;
+            font-size: var(--msg-font-size);
+            overflow: hidden;
+            padding: 12px;
+            -webkit-font-smoothing: antialiased;
+            text-rendering: optimizeLegibility;
+        }
+
+        /* Контейнер чата: сообщения прижаты к низу и идут снизу вверх.
+           align-items: flex-start — плашка не растягивается на всю ширину,
+           а подстраивается под длину сообщения. */
+        #chat-container {
+            display: flex;
+            flex-direction: column;
+            justify-content: flex-end;
+            align-items: flex-start;
+            height: 100%;
+            gap: var(--chat-gap);
+            overflow: hidden;
+        }
+
+        /* Плашка одного сообщения. width: fit-content — фон ровно по тексту;
+           max-width: 100% не даёт длинному сообщению вылезти за оверлей. */
+        .message {
+            flex-shrink: 0;
+            width: fit-content;
+            max-width: 100%;
+            padding: 9px 14px;
+            border-left: 3px solid var(--accent);
+            border-radius: var(--msg-radius);
+            background: linear-gradient(100deg,
+                rgba(10, 10, 14, 0.86) 0%,
+                rgba(10, 10, 14, 0.68) 100%);
+            box-shadow: 0 4px 14px rgba(0, 0, 0, 0.28);
+            line-height: 1.5;
+            text-shadow: 0 1px 2px rgba(0, 0, 0, 0.9), 0 0 6px rgba(0, 0, 0, 0.4);
+            overflow-wrap: anywhere;
+            animation: messageIn 0.32s cubic-bezier(0.22, 0.61, 0.36, 1);
+            transition: opacity 0.32s ease-in, transform 0.32s cubic-bezier(0.4, 0, 0.2, 1);
+        }
+
+        /* Состояние «исчезает»: уезжает влево, чуть уменьшается и гаснет */
+        .message.leaving {
+            opacity: 0;
+            transform: translateX(-56px) scale(0.98);
+            pointer-events: none;
+        }
+
+        /* Имя зрителя — цвет задаётся индивидуально из JavaScript */
+        .username {
+            font-weight: 700;
+            letter-spacing: 0.1px;
+        }
+
+        /* Значки рядом с ником */
+        .badge-img {
+            width: var(--badge-size);
+            height: var(--badge-size);
+            margin-right: 3px;
+            vertical-align: middle;
+            border-radius: 4px;
+            box-shadow: 0 1px 3px rgba(0, 0, 0, 0.45);
+        }
+
+        /* Классы ниже создаёт библиотека смайлов emotettv */
+        .emotettv-emote { margin: 0 2px !important; vertical-align: middle; }
+        .emotettv-img {
+            height: var(--emote-height) !important;
+            margin-bottom: 0 !important;
+            vertical-align: middle;
+        }
+
+        /* Появление сообщения: вылетает слева, как зеркало исчезновения */
+        @keyframes messageIn {
+            from { opacity: 0; transform: translateX(-56px) scale(0.98); }
+            to   { opacity: 1; transform: translateX(0)     scale(1); }
+        }
+
+        /* Если в системе отключены анимации — не навязываем их */
+        @media (prefers-reduced-motion: reduce) {
+            .message { animation: none; transition: none; }
+        }
+    </style>
+</head>
+<body>
+    <div id="chat-container"></div>
+
+    <script type="module">
+        // Библиотека, которая превращает названия смайлов в картинки
+        // (Twitch, BTTV, 7TV, FFZ). Значки грузим отдельно — см. ниже.
+        import { parseEmotes } from "https://cdn.jsdelivr.net/npm/emotettv@1.0.2/dist/index.es.js";
+
+        // ============================================================
+        //  НАСТРОЙКИ — обычно менять нужно только этот блок
+        // ============================================================
+        const channelName = "splicer_irl";   // канал Twitch (без #)
+        const maxMessages = 10;              // максимум сообщений на экране
+
+        // Через сколько секунд сообщение исчезает само.
+        // 15 = 15 секунд. Поставьте 0, чтобы сообщения НЕ исчезали по времени.
+        const messageLifetimeSeconds = 15;
+
+        // Какие сервисы смайлов использовать: true — включено, false — выключено.
+        // Недоступные сервисы отключаются автоматически при запуске.
+        const useEmotes = {
+            twitch: true,
+            bttv: true,
+            ffz: true,
+            seventv: true
+        };
+
+        // ============================================================
+        //  ТЕХНИЧЕСКИЕ КОНСТАНТЫ — менять не обязательно
+        // ============================================================
+        const wsUrl = "wss://irc-ws.chat.twitch.tv:443"; // сервер чата Twitch
+        const requestTimeoutMs = 5000;                  // ожидание ответа от CDN
+        const fadeDurationMs = 320;                     // анимация исчезновения (как в CSS)
+        const badgesGlobalUrl = "https://api.ivr.fi/v2/twitch/badges/global";
+        const badgesChannelUrl = id => `https://api.ivr.fi/v2/twitch/badges/channel?id=${encodeURIComponent(id)}`;
+
+        // emotettv заново скачивает списки смайлов на каждое сообщение,
+        // если у канала нет собственных смайлов. Запоминаем ответы серверов,
+        // чтобы после первого сообщения чат работал без задержек.
+        const fetchCache = new Map();
+        const nativeFetch = window.fetch.bind(window);
+        window.fetch = (input, init) => {
+            const url = String(typeof input === 'string' ? input : input.url);
+            if (!fetchCache.has(url)) {
+                fetchCache.set(url, nativeFetch(input, init).then(response => response.clone()));
+            }
+            return fetchCache.get(url).then(response => response.clone());
+        };
+
+        // ============================================================
+        //  ОБЩИЕ ФУНКЦИИ
+        // ============================================================
+        const container = document.getElementById('chat-container');
+
+        // Экранирует HTML-символы, чтобы текст из чата не ломал страницу
+        function escapeHtml(text) {
+            return String(text)
+                .replace(/&/g, '&amp;')
+                .replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;')
+                .replace(/"/g, '&quot;')
+                .replace(/'/g, '&#39;');
+        }
+
+        // Twitch может прислать пустой или битый цвет — тогда берём фиолетовый
+        function normalizeColor(color) {
+            return /^#[0-9a-fA-F]{6}$/.test(color || '') ? color : '#9147ff';
+        }
+
+        // Добавляет к запросу таймаут, чтобы зависший CDN не тормозил чат
+        function withTimeout(promise, ms) {
+            let timer;
+            const timeout = new Promise((_, reject) => {
+                timer = setTimeout(() => reject(new Error('timeout')), ms);
+            });
+            return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+        }
+
+        // Скачивает JSON с таймаутом
+        async function fetchJson(url) {
+            const response = await withTimeout(fetch(url), requestTimeoutMs);
+            if (!response.ok) throw new Error(`HTTP ${response.status}`);
+            return response.json();
+        }
+
+        // ============================================================
+        //  ЗНАЧКИ (стример, модератор, сабскрайбер и т.д.)
+        // ============================================================
+        // Библиотека emotettv берёт значки с неработающего сервера, поэтому
+        // скачиваем их сами. Ответ API выглядит так:
+        // [{ set_id: "moderator", versions: [{ id: "1", title: "...", image_url_2x: "..." }] }]
+        let globalBadgesPromise = null;
+        const channelBadgesPromises = new Map();
+
+        // Превращает ответ API в удобный список: "moderator/1" -> { title, src }
+        function makeBadgeMap(sets) {
+            const map = new Map();
+            for (const set of Array.isArray(sets) ? sets : []) {
+                for (const version of set.versions || []) {
+                    map.set(`${set.set_id}/${version.id}`, {
+                        title: version.title || set.set_id,
+                        src: version.image_url_2x || version.image_url_1x || version.image_url_4x
+                    });
+                }
+            }
+            return map;
+        }
+
+        // Скачивает значки; если не получилось — возвращает пустой список
+        async function downloadBadgeMap(url) {
+            try {
+                return makeBadgeMap(await fetchJson(url));
+            } catch (error) {
+                console.warn('Не удалось загрузить значки:', url, error);
+                return new Map();
+            }
+        }
+
+        // Глобальные значки (одинаковые для всех каналов)
+        function loadGlobalBadges() {
+            if (!globalBadgesPromise) {
+                globalBadgesPromise = downloadBadgeMap(badgesGlobalUrl);
+            }
+            return globalBadgesPromise;
+        }
+
+        // Значки конкретного канала (свои сабы, награды и т.п.)
+        function loadChannelBadges(channelId) {
+            if (!channelId) return Promise.resolve(new Map());
+            if (!channelBadgesPromises.has(channelId)) {
+                channelBadgesPromises.set(channelId, downloadBadgeMap(badgesChannelUrl(channelId)));
+            }
+            return channelBadgesPromises.get(channelId);
+        }
+
+        // "broadcaster/1,moderator/1" -> HTML с картинками значков
+        async function renderBadges(badgesTag, channelId) {
+            const pairs = (badgesTag || '').split(',').filter(Boolean);
+            if (!pairs.length) return '';
+
+            const [globalBadges, channelBadges] = await Promise.all([
+                loadGlobalBadges(),
+                loadChannelBadges(channelId)
+            ]);
+
+            return pairs.map(pair => {
+                // значки канала важнее глобальных
+                const badge = channelBadges.get(pair) || globalBadges.get(pair);
+                if (!badge || !badge.src) return '';
+                return `<img class="badge-img" src="${escapeHtml(badge.src)}" alt="${escapeHtml(badge.title)}" title="${escapeHtml(badge.title)}">`;
+            }).join('');
+        }
+
+        // ============================================================
+        //  СМАЙЛЫ
+        // ============================================================
+        // Twitch присылает смайлы строкой вида "25:0-4,12-16/1902:6-10":
+        // "/" разделяет разные смайлы, "," — позиции одного смайла.
+        // Библиотеке нужен объект: { "25": ["0-4", "12-16"], "1902": ["6-10"] }
+        function parseEmotesTag(emotesTag) {
+            const result = {};
+            for (const part of (emotesTag || '').split('/')) {
+                const [id, ranges] = part.split(':');
+                if (id && ranges) result[id] = ranges.split(',');
+            }
+            return result;
+        }
+
+        // Превращает текст сообщения в HTML со смайлами.
+        // Если CDN не ответил — вернёт null, и сообщение покажется текстом.
+        async function renderEmotes(text, emotesTag, channelId) {
+            try {
+                const message = await withTimeout(
+                    parseEmotes(text, parseEmotesTag(emotesTag), { providers: useEmotes, channelId }),
+                    requestTimeoutMs
+                );
+                return message.toHTML(1, true, true); // 1 = размер, true = экранировать текст
+            } catch (error) {
+                console.warn('Не удалось загрузить смайлы, показываю текст:', error);
+                return null;
+            }
+        }
+
+        // ============================================================
+        //  ПОКАЗ СООБЩЕНИЙ
+        // ============================================================
+
+        // Плавно убирает сообщение с экрана
+        function removeMessage(messageEl) {
+            // если у сообщения ещё тикает таймер автоскрытия — отменяем
+            if (messageEl.hideTimer) {
+                clearTimeout(messageEl.hideTimer);
+                messageEl.hideTimer = null;
+            }
+            if (messageEl.classList.contains('leaving')) return; // уже исчезает
+
+            messageEl.classList.add('leaving');
+            setTimeout(() => messageEl.remove(), fadeDurationMs);
+        }
+
+        // Запускает таймер автоскрытия для одного сообщения
+        function scheduleHide(messageEl) {
+            if (messageLifetimeSeconds <= 0) return; // 0 = автоскрытие выключено
+            messageEl.hideTimer = setTimeout(
+                () => removeMessage(messageEl),
+                messageLifetimeSeconds * 1000
+            );
+        }
+
+        // Убирает самые старые сообщения, если превышен лимит
+        function trimMessages() {
+            const visible = [...container.children].filter(el => !el.classList.contains('leaving'));
+            const extra = visible.length - maxMessages;
+            if (extra > 0) visible.slice(0, extra).forEach(removeMessage);
+        }
+
+        // Готовит сообщение: загружает значки и смайлы, собирает HTML
+        async function createMessageElement({ displayName, text, color, badgesTag, emotesTag, channelId }) {
+            const safeColor = normalizeColor(color);
+            const messageEl = document.createElement('div');
+            messageEl.className = 'message';
+            messageEl.style.borderLeftColor = safeColor;
+
+            // значки и смайлы грузим параллельно, чтобы не ждать дважды
+            const [badgesHtml, emotesHtml] = await Promise.all([
+                renderBadges(badgesTag, channelId).catch(() => ''),
+                renderEmotes(text, emotesTag, channelId)
+            ]);
+
+            messageEl.innerHTML =
+                badgesHtml
+                + `<span class="username" style="color:${safeColor}">${escapeHtml(displayName)}:</span> `
+                + (emotesHtml ?? escapeHtml(text));
+            return messageEl;
+        }
+
+        // Ставит готовое сообщение на экран и запускает таймер исчезновения
+        function displayMessage(messageEl) {
+            container.appendChild(messageEl);
+            scheduleHide(messageEl);
+            trimMessages();
+        }
+
+        // Сообщения показываем строго по очереди, иначе из-за загрузки смайлов
+        // они могут появиться не в том порядке. При этом загрузку запускаем
+        // сразу для всех — так очередь не тормозит сама себя.
+        let messageQueue = Promise.resolve();
+        function queueMessage(data) {
+            const prepared = createMessageElement(data).catch(error => {
+                console.error('Ошибка при подготовке сообщения:', error);
+                return null;
+            });
+
+            messageQueue = messageQueue
+                .then(async () => {
+                    const messageEl = await prepared;
+                    if (messageEl) displayMessage(messageEl);
+                })
+                .catch(error => console.error('Ошибка при показе сообщения:', error));
+        }
+
+        // ============================================================
+        //  РАЗБОР СООБЩЕНИЙ TWITCH IRC
+        // ============================================================
+        // Пример строки от Twitch:
+        // @badges=moderator/1;color=#00FF00;display-name=Vasya :vasya!vasya@vasya.tmi.twitch.tv PRIVMSG #channel :Привет Kappa
+        //
+        // После разбора получаем:
+        // tags    = { badges: "moderator/1", color: "#00FF00", "display-name": "Vasya" }
+        // prefix  = { nick: "vasya" }
+        // command = "PRIVMSG"
+        // params  = ["#channel", "Привет Kappa"]  — текст может содержать пробелы
+        function unescapeTag(value) {
+            return value
+                .replace(/\\s/g, ' ')
+                .replace(/\\:/g, ';')
+                .replace(/\\r/g, '\r')
+                .replace(/\\n/g, '\n')
+                .replace(/\\\\/g, '\\');
+        }
+
+        function parseIRCMessage(rawLine) {
+            const message = { tags: {}, prefix: {}, command: '', params: [] };
+            let rest = rawLine.trim();
+
+            // 1. Теги — начинаются с @ и идут через ;
+            if (rest.startsWith('@')) {
+                const spaceIndex = rest.indexOf(' ');
+                if (spaceIndex === -1) return null;
+
+                const tagsPart = rest.slice(1, spaceIndex);
+                rest = rest.slice(spaceIndex + 1);
+
+                for (const tag of tagsPart.split(';')) {
+                    const equalIndex = tag.indexOf('=');
+                    if (equalIndex === -1) {
+                        message.tags[tag] = '';
+                    } else {
+                        message.tags[tag.slice(0, equalIndex)] = unescapeTag(tag.slice(equalIndex + 1));
+                    }
+                }
+            }
+
+            // 2. Префикс — начинается с : и содержит автора сообщения
+            if (rest.startsWith(':')) {
+                const spaceIndex = rest.indexOf(' ');
+                if (spaceIndex === -1) return null;
+
+                const prefixPart = rest.slice(1, spaceIndex);
+                rest = rest.slice(spaceIndex + 1);
+
+                const nick = prefixPart.match(/^([^!@]+)/);
+                message.prefix.nick = nick ? nick[1] : prefixPart;
+            }
+
+            // 3. Команда: PRIVMSG, PING, 001 и т.д.
+            const spaceIndex = rest.indexOf(' ');
+            if (spaceIndex === -1) {
+                message.command = rest.toUpperCase();
+                return message;
+            }
+            message.command = rest.slice(0, spaceIndex).toUpperCase();
+            rest = rest.slice(spaceIndex + 1);
+
+            // 4. Параметры. Последний (текст сообщения) начинается с : и может содержать пробелы
+            while (rest.length > 0) {
+                if (rest.startsWith(':')) {
+                    message.params.push(rest.slice(1));
+                    break;
+                }
+
+                const nextSpace = rest.indexOf(' ');
+                if (nextSpace === -1) {
+                    message.params.push(rest);
+                    break;
+                }
+                message.params.push(rest.slice(0, nextSpace));
+                rest = rest.slice(nextSpace + 1);
+            }
+
+            return message;
+        }
+
+        // ============================================================
+        //  ПОДКЛЮЧЕНИЕ К TWITCH
+        // ============================================================
+        let socket = null;
+        let reconnectAttempt = 0;
+        let reconnectTimer = null;
+
+        function connect() {
+            clearTimeout(reconnectTimer);
+
+            // закрываем старое соединение, если оно было
+            if (socket) {
+                socket.onclose = null;
+                socket.onerror = null;
+                try { socket.close(); } catch (error) { /* уже закрыто */ }
+            }
+
+            socket = new WebSocket(wsUrl);
+
+            // Подключились: представляемся анонимным зрителем и просим теги
+            socket.onopen = () => {
+                console.log('Подключено к чату Twitch');
+                reconnectAttempt = 0;
+                socket.send('CAP REQ :twitch.tv/tags twitch.tv/commands'); // нужны значки и смайлы
+                socket.send('PASS SCHMOOPIIE');                            // анонимный вход
+                socket.send('NICK justinfan12345');
+                // В канал вступаем после ответа 001 — см. handleTwitchMessage()
+            };
+
+            socket.onmessage = event => {
+                // Twitch может прислать несколько строк одним пакетом
+                for (const line of String(event.data).split(/\r?\n/)) {
+                    if (line) handleTwitchMessage(line);
+                }
+            };
+
+            socket.onerror = error => console.error('Ошибка WebSocket:', error);
+
+            // Связь оборвалась — переподключаемся с нарастающей паузой (1, 2, 4... секунд)
+            socket.onclose = () => {
+                const delaySeconds = Math.min(30, 2 ** reconnectAttempt++);
+                console.log(`Связь потеряна. Переподключение через ${delaySeconds} с...`);
+                reconnectTimer = setTimeout(connect, delaySeconds * 1000);
+            };
+        }
+
+        function handleTwitchMessage(rawLine) {
+            // Twitch проверяет, что мы живы — обязательно отвечаем
+            if (rawLine.startsWith('PING')) {
+                socket.send('PONG :tmi.twitch.tv');
+                return;
+            }
+
+            const message = parseIRCMessage(rawLine);
+            if (!message) return;
+
+            // 001 = успешный вход. Теперь можно вступить в канал.
+            if (message.command === '001') {
+                socket.send(`JOIN #${channelName.toLowerCase()}`);
+                return;
+            }
+
+            // Twitch просит переподключиться (например, перед обслуживанием)
+            if (message.command === 'RECONNECT') {
+                socket.close();
+                return;
+            }
+
+            // PRIVMSG = обычное сообщение в чате
+            if (message.command === 'PRIVMSG') {
+                const login = message.prefix.nick || '';
+                const displayName = message.tags['display-name'] || login;
+                const text = message.params[1] || '';
+                if (!displayName || !text) return;
+
+                queueMessage({
+                    displayName,
+                    text,
+                    color: message.tags['color'],
+                    badgesTag: message.tags['badges'] || '',
+                    emotesTag: message.tags['emotes'] || '',
+                    channelId: message.tags['room-id'] || ''
+                });
+            }
+        }
+
+        // ============================================================
+        //  ПРОВЕРКА СЕРВИСОВ СМАЙЛОВ
+        // ============================================================
+        // FFZ и 7TV в некоторых регионах недоступны. Если сервис не отвечает,
+        // отключаем его, чтобы каждое сообщение не ждало таймаут.
+        function disableProviderIfUnavailable(name, url, title) {
+            withTimeout(fetch(url), 3000)
+                .then(response => {
+                    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+                })
+                .catch(() => {
+                    useEmotes[name] = false;
+                    console.warn(`${title} недоступен — его смайлы отключены до перезагрузки`);
+                });
+        }
+
+        // ============================================================
+        //  ЗАПУСК
+        // ============================================================
+        loadGlobalBadges(); // заранее грузим значки, чтобы первое сообщение не ждало
+        disableProviderIfUnavailable('ffz', 'https://api.frankerfacez.com/v1/set/global', 'FFZ');
+        disableProviderIfUnavailable('seventv', 'https://7tv.io/v3/emote-sets/global', '7TV');
+        connect();
+    </script>
+</body>
+</html>
