@@ -21,7 +21,7 @@
            ============================================================ */
         :root {
             --gold: #ffd166;         /* цвет суммы */
-            --panel-width: 360px;    /* ширина плашки */
+            --panel-width: 440px;    /* фиксированная ширина плашки (не зависит от источника OBS) */
             --font-size: 17px;       /* базовый размер текста */
             --radius: 13px;          /* скругление плашки */
         }
@@ -94,15 +94,31 @@
             white-space: nowrap;
         }
 
-        /* Имя донатера */
+        /* Имя донатера: если не влезает по ширине — текст перематывается */
         .name {
             flex: 1;
             min-width: 0;
             overflow: hidden;
-            text-overflow: ellipsis;
             white-space: nowrap;
             font-weight: 700;
             font-size: 18px;
+        }
+
+        .name-text {
+            display: inline-block;
+            white-space: nowrap;
+            will-change: transform;
+        }
+
+        /* Длинный ник едет справа налево, потом начинается заново */
+        .name-text.is-scrolling {
+            animation: nameScroll var(--scroll-duration, 6s) linear infinite;
+        }
+
+        /* 0–12% — пауза в начале, дальше плавная перемотка до конца */
+        @keyframes nameScroll {
+            0%, 12% { transform: translateX(0); }
+            100%    { transform: translateX(calc(-1 * var(--scroll-shift, 0px))); }
         }
 
         /* "за" */
@@ -137,6 +153,7 @@
         @media (prefers-reduced-motion: reduce) {
             .thanks-row.row-in,
             .thanks-row.row-out { animation: none; }
+            .name-text.is-scrolling { animation: none; }
         }
     </style>
 </head>
@@ -157,7 +174,7 @@
             tail: 'за',                  // слово перед суммой
             showSeconds: 10,             // сколько показывать каждого донатера
             pauseSeconds: 40,            // пауза после того, как список закончился
-            refreshSeconds: 30           // как часто перечитывать data.js (0 = не обновлять)
+            refreshSeconds: 3            // как часто перечитывать data.js (0 = не обновлять)
         };
 
         // ============================================================
@@ -174,6 +191,7 @@
         let showTimer = null;    // таймер показа донатера
         let outTimer = null;     // таймер ухода последней строки перед паузой
         let pauseTimer = null;   // таймер паузы перед новым кругом
+        let topSignature = '';   // ник и сумма текущего лидера — чтобы ловить смену первого места
 
         // Экранирует HTML-символы, чтобы ники не ломали страницу
         function escapeHtml(text) {
@@ -217,9 +235,30 @@
         // Разметка строки благодарности
         function rowPhrase(row) {
             return `<span class="thanks-prefix">${escapeHtml(CONFIG.prefix)}</span>` +
-                `<span class="name" title="${escapeHtml(row.username)}">${escapeHtml(row.username)}</span>` +
+                `<span class="name" title="${escapeHtml(row.username)}">` +
+                `<span class="name-text">${escapeHtml(row.username)}</span></span>` +
                 `<span class="thanks-tail">${escapeHtml(CONFIG.tail)}</span>` +
                 `<span class="amount">${escapeHtml(formatAmount(row.amount, row.currency))}</span>`;
+        }
+
+        // Если ник длиннее места — включаем перемотку и возвращаем,
+        // сколько миллисекунд нужно, чтобы текст прочитался целиком.
+        // Скорость примерно 50 px/сек.
+        function startNameScroll(el) {
+            const nameEl = el.querySelector('.name');
+            const textEl = el.querySelector('.name-text');
+            if (!nameEl || !textEl) return 0;
+
+            // +6 px, чтобы последняя буква не прилипала к краю
+            const shift = Math.ceil(textEl.scrollWidth - nameEl.clientWidth);
+            if (shift < 6) return 0;
+
+            const duration = Math.max(3, (shift + 6) / 50);
+            textEl.style.setProperty('--scroll-shift', (shift + 6) + 'px');
+            textEl.style.setProperty('--scroll-duration', duration.toFixed(1) + 's');
+            textEl.classList.add('is-scrolling');
+
+            return duration * 1000;
         }
 
         function setPlateVisible(visible) {
@@ -269,7 +308,12 @@
             showing = el;
             rowEl.appendChild(el);
 
-            showTimer = setTimeout(hideCurrent, Math.max(1, CONFIG.showSeconds) * 1000);
+            // Длинный ник получает дополнительное время: строка висит,
+            // пока текст не доедет до конца, и ещё 1,5 секунды после этого
+            const scrollMs = startNameScroll(el);
+            const showMs = Math.max(Math.max(1, CONFIG.showSeconds) * 1000, scrollMs ? scrollMs + 1500 : 0);
+
+            showTimer = setTimeout(hideCurrent, showMs);
         }
 
         // Время донатера вышло: листаем к следующему с наслойкой,
@@ -315,13 +359,50 @@
 
         // Вызывается после чтения data.js — запускает цикл, если он простаивает
         function afterDataLoad() {
-            donors = getDonors();
+            const fresh = getDonors();
+
+            // Файл могли прочитать в момент перезаписи — не теряем прошлый список
+            if (!fresh.length && donors.length) {
+                return;
+            }
+
+            const signature = fresh.length ? (fresh[0].username + '|' + fresh[0].amount) : '';
+            const leaderChanged = topSignature !== '' && signature !== '' && signature !== topSignature;
+            topSignature = signature;
+            donors = fresh;
+
+            if (!donors.length) {
+                showing = null;
+                setPlateVisible(false);
+                return;
+            }
+
+            // Новый лидер — показываем его сразу, не дожидаясь конца круга
+            if (leaderChanged) {
+                jumpToLeader();
+                return;
+            }
 
             const idle = showing === null && outTimer === null && pauseTimer === null;
-            if (idle && donors.length) {
+            if (idle) {
                 donorIndex = 0;
                 setTimeout(showNext, 400);
             }
+        }
+
+        // Мгновенно переключает плашку на первого донатера из свежего списка
+        function jumpToLeader() {
+            clearTimeout(showTimer);
+            showTimer = null;
+            clearTimeout(outTimer);
+            outTimer = null;
+            clearTimeout(pauseTimer);
+            pauseTimer = null;
+
+            [...rowEl.children].forEach(child => child.remove());
+            showing = null;
+            donorIndex = 0;
+            showElement();
         }
 
         // ============================================================
