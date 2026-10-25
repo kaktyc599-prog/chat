@@ -11,6 +11,7 @@
         • Канал, лимит сообщений и время исчезновения — блок «НАСТРОЙКИ» в скрипте.
         • Цвета, размеры и скругления — блок «:root» в начале стилей.
         • Чтобы сообщения не исчезали по времени — messageLifetimeSeconds = 0.
+        • Ответы на сообщения показываются с цитатой «╭── ник: текст» над ответом.
     -->
 
     <style>
@@ -104,6 +105,44 @@
         .emotettv-img {
             height: var(--emote-height) !important;
             margin-bottom: 0 !important;
+            vertical-align: middle;
+        }
+
+        /* Ответ на сообщение: над ответом — приглушённая цитата
+           исходного сообщения в формате «╭── ник: текст» */
+        .reply-quote {
+            margin-bottom: 4px;
+            font-size: 0.82em;
+            line-height: 1.45;
+            color: rgba(255, 255, 255, 0.58);
+            /* одна строка: длинная цитата аккуратно обрезается многоточием */
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            max-width: 100%;
+        }
+
+        /* Уголок с линией перед цитатой */
+        .reply-quote .reply-mark {
+            margin-right: 3px;
+            color: rgba(255, 255, 255, 0.5);
+        }
+
+        /* Ник автора цитируемого сообщения — чуть заметнее текста */
+        .reply-quote .reply-name {
+            font-weight: 700;
+            color: rgba(255, 255, 255, 0.82);
+        }
+
+        /* Смайлы в цитате — меньше, чем в самом сообщении */
+        .reply-quote .emotettv-emote { display: inline-block; }
+        .reply-quote .emotettv-img { height: 19px !important; }
+
+        /* Значки в цитате — компактнее, чем в сообщении */
+        .reply-quote .badge-img {
+            width: 15px;
+            height: 15px;
+            margin-right: 3px;
             vertical-align: middle;
         }
 
@@ -254,6 +293,36 @@
             return channelBadgesPromises.get(channelId);
         }
 
+        // ============================================================
+        //  РОЛИ ДЛЯ ЦИТАТЫ ОТВЕТА
+        // ============================================================
+        // Twitch не присылает значки родительского сообщения в тегах ответа.
+        // Для сообщений, которые оверлей уже видел, берём их из кэша,
+        // а для остальных смотрим список модераторов/VIP канала.
+        const modVipUrl = channel => `https://api.ivr.fi/v2/twitch/modvip/${encodeURIComponent(channel)}`;
+        let modVipPromise = null;
+
+        function loadModVip() {
+            if (!modVipPromise) {
+                modVipPromise = fetchJson(modVipUrl(channelName))
+                    .then(data => {
+                        const roles = new Map();
+                        for (const mod of data.mods || []) {
+                            roles.set(String(mod.login || '').toLowerCase(), 'moderator/1');
+                        }
+                        for (const vip of data.vips || []) {
+                            roles.set(String(vip.login || '').toLowerCase(), 'vip/1');
+                        }
+                        return roles;
+                    })
+                    .catch(error => {
+                        console.warn('Не удалось загрузить список модераторов/VIP:', error);
+                        return new Map();
+                    });
+            }
+            return modVipPromise;
+        }
+
         // "broadcaster/1,moderator/1" -> HTML с картинками значков
         async function renderBadges(badgesTag, channelId) {
             const pairs = (badgesTag || '').split(',').filter(Boolean);
@@ -302,6 +371,113 @@
             }
         }
 
+        // Twitch добавляет в начало текста ответа упоминание «@ник».
+        // Убираем его и сдвигаем позиции смайлов, чтобы они остались на месте.
+        function stripLeadingMention(text, emotesTag) {
+            const match = /^@[^\s,@:]{1,25}(?:[,:]\s*|\s+)/.exec(text);
+            if (!match) return { text, emotesTag };
+
+            const shift = match[0].length;
+            const shiftedEmotes = (emotesTag || '').split('/').map(part => {
+                const [id, ranges] = part.split(':');
+                if (!id || !ranges) return '';
+                const shifted = ranges.split(',').map(range => {
+                    const [start, end] = range.split('-').map(Number);
+                    if (!Number.isFinite(start) || !Number.isFinite(end) || end < shift) return '';
+                    return `${Math.max(0, start - shift)}-${end - shift}`;
+                }).filter(Boolean);
+                return shifted.length ? `${id}:${shifted.join(',')}` : '';
+            }).filter(Boolean).join('/');
+
+            return { text: text.slice(shift), emotesTag: shiftedEmotes };
+        }
+
+        // ============================================================
+        //  ОТВЕТЫ НА СООБЩЕНИЯ (reply)
+        // ============================================================
+        // Когда зритель отвечает на сообщение, Twitch присылает в тегах:
+        // reply-parent-msg-id, reply-parent-display-name, reply-parent-msg-body.
+        // Последние сообщения запоминаем по id — если текст или значки
+        // родителя в тегах не придут, возьмём их из памяти.
+        const recentMessagesLimit = 200;
+        const recentMessages = new Map(); // id -> { displayName, text, emotesTag, badgesTag, userLogin }
+
+        function rememberMessage(id, data) {
+            if (!id) return;
+            recentMessages.set(id, data);
+            if (recentMessages.size > recentMessagesLimit) {
+                recentMessages.delete(recentMessages.keys().next().value);
+            }
+        }
+
+        // Собирает данные цитируемого сообщения из тегов ответа
+        function getReplyData(tags) {
+            const id = tags['reply-parent-msg-id'] || '';
+            const parentName = tags['reply-parent-display-name'] || tags['reply-parent-user-login'] || '';
+            const rawParentText = tags['reply-parent-msg-body'] || '';
+            if (!id && !parentName && !rawParentText) return null;
+
+            // запасной вариант — сообщение, которое уже видел оверлей
+            const cached = id ? recentMessages.get(id) : null;
+
+            let parentText = cached?.text || '';
+            let parentEmotesTag = cached?.emotesTag || '';
+            if (rawParentText) {
+                const stripped = stripLeadingMention(rawParentText, tags['reply-parent-emotes'] || '');
+                parentText = stripped.text;
+                parentEmotesTag = stripped.emotesTag;
+            }
+
+            return {
+                displayName: parentName || cached?.displayName || '',
+                text: parentText,
+                emotesTag: parentEmotesTag,
+                badgesTag: cached?.badgesTag || '',
+                userLogin: (tags['reply-parent-user-login'] || cached?.userLogin || '').toLowerCase()
+            };
+        }
+
+        // Значки автора цитаты: только стример, модератор и VIP
+        async function renderReplyBadges(reply, channelId) {
+            let badgesTag = reply.badgesTag || '';
+
+            // родителя не было в кэше — определяем роль отдельно
+            if (!badgesTag && reply.userLogin) {
+                if (reply.userLogin === channelName.toLowerCase()) {
+                    badgesTag = 'broadcaster/1';
+                } else {
+                    badgesTag = (await loadModVip()).get(reply.userLogin) || '';
+                }
+            }
+
+            const allowed = badgesTag.split(',')
+                .filter(pair => /^(broadcaster|moderator|vip)\//.test(pair));
+            if (!allowed.length) return '';
+
+            return renderBadges(allowed.join(','), channelId).catch(() => '');
+        }
+
+        // Цитата исходного сообщения: «╭── значок ник: текст» над ответом
+        async function renderReplyQuote(reply, channelId) {
+            if (!reply) return '';
+            const name = reply.displayName || '';
+            const text = reply.text || '';
+            if (!name && !text) return '';
+
+            // смайлы и значки цитаты грузим параллельно
+            const [emotesHtml, badgesHtml] = await Promise.all([
+                text ? renderEmotes(text, reply.emotesTag, channelId) : Promise.resolve(null),
+                renderReplyBadges(reply, channelId)
+            ]);
+
+            const nameHtml = name
+                ? `<span class="reply-name">${escapeHtml(name)}</span>${text ? ':' : ''}`
+                : '';
+            const textHtml = text ? (emotesHtml ?? escapeHtml(text)) : '';
+
+            return `<div class="reply-quote"><span class="reply-mark">╭──</span> ${badgesHtml}${nameHtml}${nameHtml && textHtml ? ' ' : ''}${textHtml}</div>`;
+        }
+
         // ============================================================
         //  ПОКАЗ СООБЩЕНИЙ
         // ============================================================
@@ -336,20 +512,22 @@
         }
 
         // Готовит сообщение: загружает значки и смайлы, собирает HTML
-        async function createMessageElement({ displayName, text, color, badgesTag, emotesTag, channelId }) {
+        async function createMessageElement({ displayName, text, color, badgesTag, emotesTag, channelId, reply }) {
             const safeColor = normalizeColor(color);
             const messageEl = document.createElement('div');
             messageEl.className = 'message';
             messageEl.style.borderLeftColor = safeColor;
 
-            // значки и смайлы грузим параллельно, чтобы не ждать дважды
-            const [badgesHtml, emotesHtml] = await Promise.all([
+            // значки, смайлы и цитату ответа грузим параллельно, чтобы не ждать дважды
+            const [badgesHtml, emotesHtml, replyHtml] = await Promise.all([
                 renderBadges(badgesTag, channelId).catch(() => ''),
-                renderEmotes(text, emotesTag, channelId)
+                renderEmotes(text, emotesTag, channelId),
+                renderReplyQuote(reply, channelId)
             ]);
 
             messageEl.innerHTML =
-                badgesHtml
+                replyHtml
+                + badgesHtml
                 + `<span class="username" style="color:${safeColor}">${escapeHtml(displayName)}:</span> `
                 + (emotesHtml ?? escapeHtml(text));
             return messageEl;
@@ -534,16 +712,30 @@
             if (message.command === 'PRIVMSG') {
                 const login = message.prefix.nick || '';
                 const displayName = message.tags['display-name'] || login;
-                const text = message.params[1] || '';
-                if (!displayName || !text) return;
+                const rawText = message.params[1] || '';
+                if (!displayName || !rawText) return;
+
+                // убираем «@ник» в начале текста и подгоняем позиции смайлов
+                const { text, emotesTag } = stripLeadingMention(rawText, message.tags['emotes'] || '');
+                const channelId = message.tags['room-id'] || '';
+
+                // запоминаем сообщение — пригодится, если на него ответят
+                rememberMessage(message.tags['id'] || '', {
+                    displayName,
+                    text,
+                    emotesTag,
+                    badgesTag: message.tags['badges'] || '',
+                    userLogin: login.toLowerCase()
+                });
 
                 queueMessage({
                     displayName,
                     text,
                     color: message.tags['color'],
                     badgesTag: message.tags['badges'] || '',
-                    emotesTag: message.tags['emotes'] || '',
-                    channelId: message.tags['room-id'] || ''
+                    emotesTag,
+                    channelId,
+                    reply: getReplyData(message.tags)
                 });
             }
         }
@@ -568,6 +760,7 @@
         //  ЗАПУСК
         // ============================================================
         loadGlobalBadges(); // заранее грузим значки, чтобы первое сообщение не ждало
+        loadModVip();       // роли для цитат ответов (модератор/VIP)
         disableProviderIfUnavailable('ffz', 'https://api.frankerfacez.com/v1/set/global', 'FFZ');
         disableProviderIfUnavailable('seventv', 'https://7tv.io/v3/emote-sets/global', '7TV');
         connect();

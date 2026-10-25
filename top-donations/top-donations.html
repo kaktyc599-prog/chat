@@ -1,0 +1,350 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <title>Спасибо за донаты — OBS</title>
+
+    <!--
+        БЛАГОДАРНОСТИ ЗА ДОНАТЫ ДЛЯ OBS
+        ─────────────────────────────────────────────────────────────
+        Бегущая благодарность: "Огромное спасибо — {имя} за {сумма}"
+        по очереди для ВСЕХ донатеров из top-donations-data.js.
+        После того как список закончился, пауза (по умолчанию 40 с),
+        затем список начинается заново.
+        • Данные обновляют top-donations-update.ps1 / top-donations-update.py
+        • В OBS: Browser Source → top-donations.html
+    -->
+
+    <style>
+        /* ============================================================
+           НАСТРОЙКИ ВНЕШНЕГО ВИДА
+           ============================================================ */
+        :root {
+            --gold: #ffd166;         /* цвет суммы */
+            --panel-width: 360px;    /* ширина плашки */
+            --font-size: 17px;       /* базовый размер текста */
+            --radius: 13px;          /* скругление плашки */
+        }
+
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        html, body { width: 100%; height: 100%; }
+
+        /* Прозрачный фон — как у чата, чтобы в OBS была видна игра */
+        body {
+            background: transparent;
+            color: #fff;
+            font-family: 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Segoe UI Emoji', sans-serif;
+            font-size: var(--font-size);
+            padding: 10px;
+            overflow: hidden;
+            -webkit-font-smoothing: antialiased;
+            text-rendering: optimizeLegibility;
+        }
+
+        /* Плашка благодарности */
+        #top {
+            position: relative;      /* для растворяющегося слоя строки */
+            width: var(--panel-width);
+            min-height: 53px;        /* плашка не «дышит» по высоте, даже когда строка уехала */
+            overflow: hidden;        /* анимации не вылезают за скруглённые края */
+            padding: 12px 15px;
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            border-radius: var(--radius);
+            background: linear-gradient(155deg,
+                rgba(20, 17, 30, 0.92) 0%,
+                rgba(9, 9, 13, 0.82) 100%);
+            box-shadow: 0 10px 30px rgba(0, 0, 0, 0.38);
+        }
+
+        /* Во время паузы плашка невидима, но занимает место — окно не сужается */
+        #top.is-hidden { visibility: hidden; }
+
+        /* Одна строка благодарности */
+        .thanks-row {
+            position: relative;      /* чтобы работали слои z-index */
+            display: flex;
+            align-items: baseline;
+            gap: 9px;
+            min-height: 27px;
+        }
+
+        /* Новый донатер выезжает поверх уходящего (перелистывание) */
+        .thanks-row.row-in {
+            z-index: 2;
+            animation: rowIn 0.36s cubic-bezier(0.22, 0.61, 0.36, 1) both;
+        }
+
+        /* Уходящий донатер остаётся на месте и растворяется под новым */
+        .thanks-row.row-out {
+            position: absolute;      /* не двигает плашку — высота остаётся прежней */
+            z-index: 1;
+            pointer-events: none;
+            animation: rowOut 0.32s ease-out both;
+        }
+
+        /* "Огромное спасибо" — выделено как мини-заголовок */
+        .thanks-prefix {
+            flex: 0 0 auto;
+            font-size: 12px;
+            font-weight: 700;
+            letter-spacing: 0.16em;
+            text-transform: uppercase;
+            color: var(--gold);
+            text-shadow: 0 1px 3px rgba(0, 0, 0, 0.6);
+            white-space: nowrap;
+        }
+
+        /* Имя донатера */
+        .name {
+            flex: 1;
+            min-width: 0;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+            font-weight: 700;
+            font-size: 18px;
+        }
+
+        /* "за" */
+        .thanks-tail {
+            flex: 0 0 auto;
+            font-size: 13px;
+            color: rgba(255, 255, 255, 0.62);
+            white-space: nowrap;
+        }
+
+        /* Сумма */
+        .amount {
+            flex: 0 0 auto;
+            font-weight: 700;
+            color: var(--gold);
+            font-variant-numeric: tabular-nums;
+            text-shadow: 0 1px 3px rgba(0, 0, 0, 0.6);
+        }
+
+        /* Появление строки: слева направо */
+        @keyframes rowIn {
+            from { opacity: 0; transform: translateX(-24px); }
+            to   { opacity: 1; transform: translateX(0); }
+        }
+
+        /* Уход строки: просто растворяется на месте, без смещений */
+        @keyframes rowOut {
+            from { opacity: 1; }
+            to   { opacity: 0; }
+        }
+
+        @media (prefers-reduced-motion: reduce) {
+            .thanks-row.row-in,
+            .thanks-row.row-out { animation: none; }
+        }
+    </style>
+</head>
+<body>
+    <div id="top" class="is-hidden">
+        <div id="row"></div>
+    </div>
+
+    <!-- Данные топа. Этот файл создают top-donations-update.ps1 и top-donations-update.py -->
+    <script id="data-script" src="top-donations-data.js"></script>
+
+    <script>
+        // ============================================================
+        //  НАСТРОЙКИ — обычно менять нужно только этот блок
+        // ============================================================
+        const CONFIG = {
+            prefix: 'Огромное спасибо',  // начало фразы
+            tail: 'за',                  // слово перед суммой
+            showSeconds: 10,             // сколько показывать каждого донатера
+            pauseSeconds: 40,            // пауза после того, как список закончился
+            refreshSeconds: 30           // как часто перечитывать data.js (0 = не обновлять)
+        };
+
+        // ============================================================
+        //  ИГРАЦИЯ БЛАГОДАРНОСТЕЙ
+        // ============================================================
+        const ROW_OUT_MS = 380;  // растворение строки — согласовано с CSS
+
+        const plateEl = document.getElementById('top');
+        const rowEl = document.getElementById('row');
+
+        let donors = [];         // текущий список донатеров
+        let donorIndex = 0;      // кого показываем следующим
+        let showing = null;      // статичная строка, которая сейчас видна
+        let showTimer = null;    // таймер показа донатера
+        let outTimer = null;     // таймер ухода последней строки перед паузой
+        let pauseTimer = null;   // таймер паузы перед новым кругом
+
+        // Экранирует HTML-символы, чтобы ники не ломали страницу
+        function escapeHtml(text) {
+            return String(text)
+                .replace(/&/g, '&amp;')
+                .replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;')
+                .replace(/"/g, '&quot;')
+                .replace(/'/g, '&#39;');
+        }
+
+        // Форматирует сумму: 5000 + RUB → 5 000 ₽
+        function formatAmount(value, currency) {
+            const code = String(currency || window.TOP_DONATIONS_CURRENCY || 'RUB').toUpperCase();
+            try {
+                return new Intl.NumberFormat('ru-RU', {
+                    style: 'currency',
+                    currency: code,
+                    minimumFractionDigits: 0,
+                    maximumFractionDigits: 2
+                }).format(value);
+            } catch {
+                return new Intl.NumberFormat('ru-RU').format(value) + ' ' + code;
+            }
+        }
+
+        // Собирает весь список донатеров из data.js
+        function getDonors() {
+            const source = Array.isArray(window.TOP_DONATIONS) ? window.TOP_DONATIONS : [];
+
+            return source
+                .filter(row => row && Number.isFinite(Number(row.amount)) && Number(row.amount) > 0)
+                .map(row => ({
+                    username: String(row.username || 'Аноним'),
+                    amount: Number(row.amount),
+                    currency: row.currency || window.TOP_DONATIONS_CURRENCY || 'RUB'
+                }))
+                .sort((a, b) => b.amount - a.amount);
+        }
+
+        // Разметка строки благодарности
+        function rowPhrase(row) {
+            return `<span class="thanks-prefix">${escapeHtml(CONFIG.prefix)}</span>` +
+                `<span class="name" title="${escapeHtml(row.username)}">${escapeHtml(row.username)}</span>` +
+                `<span class="thanks-tail">${escapeHtml(CONFIG.tail)}</span>` +
+                `<span class="amount">${escapeHtml(formatAmount(row.amount, row.currency))}</span>`;
+        }
+
+        function setPlateVisible(visible) {
+            plateEl.classList.toggle('is-hidden', !visible);
+        }
+
+        // Переводит строку в уходящий слой: она остаётся на месте,
+        // растворяется, а следующий донатер выезжает поверх неё
+        function startFading(el) {
+            el.style.left = el.offsetLeft + 'px';
+            el.style.top = el.offsetTop + 'px';
+            el.style.width = el.offsetWidth + 'px';
+            el.style.animationDelay = '0ms';
+            el.classList.remove('row-in');
+            el.classList.add('row-out');
+        }
+
+        // Показывает донатера под текущим номером.
+        // Перелистывание: предыдущая строка продолжает растворяться,
+        // пока новая выезжает сверху — они наслаиваются.
+        function showElement() {
+            clearTimeout(showTimer);
+            showTimer = null;
+
+            if (!donors.length) {
+                showing = null;
+                setPlateVisible(false);
+                return;
+            }
+
+            // если список стал короче — не выходим за его границы
+            donorIndex = donorIndex % donors.length;
+
+            setPlateVisible(true);
+
+            const prev = showing;
+            if (prev) {
+                startFading(prev);
+                setTimeout(() => prev.remove(), ROW_OUT_MS);
+            }
+
+            const row = donors[donorIndex];
+            const el = document.createElement('div');
+            el.className = 'thanks-row row-in';
+            el.innerHTML = rowPhrase(row);
+
+            showing = el;
+            rowEl.appendChild(el);
+
+            showTimer = setTimeout(hideCurrent, Math.max(1, CONFIG.showSeconds) * 1000);
+        }
+
+        // Время донатера вышло: листаем к следующему с наслойкой,
+        // а после последнего — прячем плашку и держим паузу
+        function hideCurrent() {
+            clearTimeout(showTimer);
+            showTimer = null;
+
+            donorIndex++;
+
+            if (donorIndex < donors.length) {
+                showElement();
+                return;
+            }
+
+            // список закончился — дождались конца текущей строки
+            donorIndex = 0;
+            const el = showing;
+            showing = null;
+            if (el) startFading(el);
+
+            outTimer = setTimeout(() => {
+                [...rowEl.children].forEach(child => child.remove());
+                outTimer = null;
+                setPlateVisible(false);
+                pauseTimer = setTimeout(showNext, Math.max(0, CONFIG.pauseSeconds) * 1000);
+            }, ROW_OUT_MS);
+        }
+
+        // Старт/продолжение цикла по свежим данным
+        function showNext() {
+            clearTimeout(pauseTimer);
+            pauseTimer = null;
+
+            donors = getDonors();
+            if (!donors.length) {
+                setPlateVisible(false);
+                return;
+            }
+
+            showElement();
+        }
+
+        // Вызывается после чтения data.js — запускает цикл, если он простаивает
+        function afterDataLoad() {
+            donors = getDonors();
+
+            const idle = showing === null && outTimer === null && pauseTimer === null;
+            if (idle && donors.length) {
+                donorIndex = 0;
+                setTimeout(showNext, 400);
+            }
+        }
+
+        // ============================================================
+        //  АВТООБНОВЛЕНИЕ ДАННЫХ
+        // ============================================================
+        // Перечитываем top-donations-data.js, не перезагружая страницу.
+        function reloadData() {
+            const oldScript = document.getElementById('data-script');
+            if (oldScript) oldScript.remove();
+
+            const script = document.createElement('script');
+            script.id = 'data-script';
+            script.src = 'top-donations-data.js?t=' + Date.now();
+            script.onload = afterDataLoad;
+            script.onerror = () => console.warn('Не удалось прочитать top-donations-data.js');
+            document.head.appendChild(script);
+        }
+
+        afterDataLoad();
+
+        if (CONFIG.refreshSeconds > 0) {
+            setInterval(reloadData, CONFIG.refreshSeconds * 1000);
+        }
+    </script>
+</body>
+</html>

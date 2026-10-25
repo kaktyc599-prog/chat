@@ -1,0 +1,8 @@
+# Секреты и локальные настройки
+top-donations/top-donations-config.json
+
+# Служебные файлы
+*.log
+*.tmp
+Thumbs.db
+.DS_Store
