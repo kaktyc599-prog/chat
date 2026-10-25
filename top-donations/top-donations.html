@@ -21,7 +21,7 @@
            ============================================================ */
         :root {
             --gold: #ffd166;         /* цвет суммы */
-            --panel-width: 440px;    /* фиксированная ширина плашки (не зависит от источника OBS) */
+            --panel-width: 380px;    /* фиксированная ширина плашки (не зависит от источника OBS) */
             --font-size: 17px;       /* базовый размер текста */
             --radius: 13px;          /* скругление плашки */
         }
@@ -56,8 +56,7 @@
             box-shadow: 0 10px 30px rgba(0, 0, 0, 0.38);
         }
 
-        /* Во время паузы плашка невидима, но занимает место — окно не сужается */
-        #top.is-hidden { visibility: hidden; }
+        /* Фон плашки всегда на месте: во время паузы он просто остаётся видимым */
 
         /* Одна строка благодарности */
         .thanks-row {
@@ -68,18 +67,18 @@
             min-height: 27px;
         }
 
-        /* Новый донатер выезжает поверх уходящего (перелистывание) */
+        /* Новая строка проявляется поверх старой — фон при этом не двигается */
         .thanks-row.row-in {
             z-index: 2;
-            animation: rowIn 0.36s cubic-bezier(0.22, 0.61, 0.36, 1) both;
+            animation: rowIn 0.28s ease-out both;
         }
 
-        /* Уходящий донатер остаётся на месте и растворяется под новым */
+        /* Уходящая строка остаётся на месте и растворяется под новой */
         .thanks-row.row-out {
             position: absolute;      /* не двигает плашку — высота остаётся прежней */
             z-index: 1;
             pointer-events: none;
-            animation: rowOut 0.32s ease-out both;
+            animation: rowOut 0.28s ease-in both;
         }
 
         /* "Огромное спасибо" — выделено как мини-заголовок */
@@ -138,13 +137,13 @@
             text-shadow: 0 1px 3px rgba(0, 0, 0, 0.6);
         }
 
-        /* Появление строки: слева направо */
+        /* Появление строки: только прозрачность, без сдвигов */
         @keyframes rowIn {
-            from { opacity: 0; transform: translateX(-24px); }
-            to   { opacity: 1; transform: translateX(0); }
+            from { opacity: 0; }
+            to   { opacity: 1; }
         }
 
-        /* Уход строки: просто растворяется на месте, без смещений */
+        /* Уход строки: растворяется на месте */
         @keyframes rowOut {
             from { opacity: 1; }
             to   { opacity: 0; }
@@ -158,7 +157,7 @@
     </style>
 </head>
 <body>
-    <div id="top" class="is-hidden">
+    <div id="top">
         <div id="row"></div>
     </div>
 
@@ -180,18 +179,17 @@
         // ============================================================
         //  ИГРАЦИЯ БЛАГОДАРНОСТЕЙ
         // ============================================================
-        const ROW_OUT_MS = 380;  // растворение строки — согласовано с CSS
+        const FADE_MS = 280;     // перекрёстное затухание строки — согласовано с CSS
 
-        const plateEl = document.getElementById('top');
         const rowEl = document.getElementById('row');
 
         let donors = [];         // текущий список донатеров
         let donorIndex = 0;      // кого показываем следующим
-        let showing = null;      // статичная строка, которая сейчас видна
+        let showing = null;      // строка, которая сейчас видна
         let showTimer = null;    // таймер показа донатера
-        let outTimer = null;     // таймер ухода последней строки перед паузой
         let pauseTimer = null;   // таймер паузы перед новым кругом
         let topSignature = '';   // ник и сумма текущего лидера — чтобы ловить смену первого места
+        let fadeTimers = [];     // таймеры удаления растворившихся строк
 
         // Экранирует HTML-символы, чтобы ники не ломали страницу
         function escapeHtml(text) {
@@ -261,12 +259,8 @@
             return duration * 1000;
         }
 
-        function setPlateVisible(visible) {
-            plateEl.classList.toggle('is-hidden', !visible);
-        }
-
-        // Переводит строку в уходящий слой: она остаётся на месте,
-        // растворяется, а следующий донатер выезжает поверх неё
+        // Переводит строку в уходящий слой: она остаётся на месте и растворяется,
+        // а новая проявляется поверх неё. Фон плашки при этом не меняется.
         function startFading(el) {
             el.style.left = el.offsetLeft + 'px';
             el.style.top = el.offsetTop + 'px';
@@ -277,27 +271,24 @@
         }
 
         // Показывает донатера под текущим номером.
-        // Перелистывание: предыдущая строка продолжает растворяться,
-        // пока новая выезжает сверху — они наслаиваются.
+        // Плашка и фон статичные: меняются только ник и сумма.
         function showElement() {
             clearTimeout(showTimer);
             showTimer = null;
 
             if (!donors.length) {
                 showing = null;
-                setPlateVisible(false);
+                [...rowEl.children].forEach(child => child.remove());
                 return;
             }
 
             // если список стал короче — не выходим за его границы
             donorIndex = donorIndex % donors.length;
 
-            setPlateVisible(true);
-
             const prev = showing;
             if (prev) {
                 startFading(prev);
-                setTimeout(() => prev.remove(), ROW_OUT_MS);
+                fadeTimers.push(setTimeout(() => prev.remove(), FADE_MS + 40));
             }
 
             const row = donors[donorIndex];
@@ -316,8 +307,9 @@
             showTimer = setTimeout(hideCurrent, showMs);
         }
 
-        // Время донатера вышло: листаем к следующему с наслойкой,
-        // а после последнего — прячем плашку и держим паузу
+        // Время донатера вышло: перелистываем к следующему.
+        // После последнего плашка не исчезает — просто держим паузу,
+        // последняя строка остаётся на экране.
         function hideCurrent() {
             clearTimeout(showTimer);
             showTimer = null;
@@ -329,18 +321,8 @@
                 return;
             }
 
-            // список закончился — дождались конца текущей строки
             donorIndex = 0;
-            const el = showing;
-            showing = null;
-            if (el) startFading(el);
-
-            outTimer = setTimeout(() => {
-                [...rowEl.children].forEach(child => child.remove());
-                outTimer = null;
-                setPlateVisible(false);
-                pauseTimer = setTimeout(showNext, Math.max(0, CONFIG.pauseSeconds) * 1000);
-            }, ROW_OUT_MS);
+            pauseTimer = setTimeout(showNext, Math.max(0, CONFIG.pauseSeconds) * 1000);
         }
 
         // Старт/продолжение цикла по свежим данным
@@ -349,11 +331,6 @@
             pauseTimer = null;
 
             donors = getDonors();
-            if (!donors.length) {
-                setPlateVisible(false);
-                return;
-            }
-
             showElement();
         }
 
@@ -373,7 +350,7 @@
 
             if (!donors.length) {
                 showing = null;
-                setPlateVisible(false);
+                [...rowEl.children].forEach(child => child.remove());
                 return;
             }
 
@@ -383,7 +360,7 @@
                 return;
             }
 
-            const idle = showing === null && outTimer === null && pauseTimer === null;
+            const idle = showing === null && pauseTimer === null;
             if (idle) {
                 donorIndex = 0;
                 setTimeout(showNext, 400);
@@ -394,10 +371,10 @@
         function jumpToLeader() {
             clearTimeout(showTimer);
             showTimer = null;
-            clearTimeout(outTimer);
-            outTimer = null;
             clearTimeout(pauseTimer);
             pauseTimer = null;
+            fadeTimers.forEach(clearTimeout);
+            fadeTimers = [];
 
             [...rowEl.children].forEach(child => child.remove());
             showing = null;
