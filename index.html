@@ -100,7 +100,7 @@
             box-shadow: 0 1px 3px rgba(0, 0, 0, 0.45);
         }
 
-        /* Классы ниже создаёт библиотека смайлов emotettv */
+        /* Классы смайлов: собственные, чтобы не зависеть от библиотек */
         .emotettv-emote { margin: 0 2px !important; vertical-align: middle; }
         .emotettv-img {
             height: var(--emote-height) !important;
@@ -162,14 +162,11 @@
     <div id="chat-container"></div>
 
     <script type="module">
-        // Библиотека, которая превращает названия смайлов в картинки
-        // (Twitch, BTTV, 7TV, FFZ). Значки грузим отдельно — см. ниже.
-        import { parseEmotes } from "https://cdn.jsdelivr.net/npm/emotettv@1.0.2/dist/index.es.js";
-
         // ============================================================
         //  НАСТРОЙКИ — обычно менять нужно только этот блок
         // ============================================================
         const channelName = "splicer_irl";   // канал Twitch (без #)
+        const channelId = "1016075712";      // ID канала — по нему грузятся смайлы канала
         const maxMessages = 10;              // максимум сообщений на экране
 
         // Через сколько секунд сообщение исчезает само.
@@ -177,7 +174,7 @@
         const messageLifetimeSeconds = 15;
 
         // Какие сервисы смайлов использовать: true — включено, false — выключено.
-        // Недоступные сервисы отключаются автоматически при запуске.
+        // Если сервис не отвечает, чат покажет текст без его смайлов.
         const useEmotes = {
             twitch: true,
             bttv: true,
@@ -193,19 +190,6 @@
         const fadeDurationMs = 320;                     // анимация исчезновения (как в CSS)
         const badgesGlobalUrl = "https://api.ivr.fi/v2/twitch/badges/global";
         const badgesChannelUrl = id => `https://api.ivr.fi/v2/twitch/badges/channel?id=${encodeURIComponent(id)}`;
-
-        // emotettv заново скачивает списки смайлов на каждое сообщение,
-        // если у канала нет собственных смайлов. Запоминаем ответы серверов,
-        // чтобы после первого сообщения чат работал без задержек.
-        const fetchCache = new Map();
-        const nativeFetch = window.fetch.bind(window);
-        window.fetch = (input, init) => {
-            const url = String(typeof input === 'string' ? input : input.url);
-            if (!fetchCache.has(url)) {
-                fetchCache.set(url, nativeFetch(input, init).then(response => response.clone()));
-            }
-            return fetchCache.get(url).then(response => response.clone());
-        };
 
         // ============================================================
         //  ОБЩИЕ ФУНКЦИИ
@@ -346,25 +330,156 @@
         // ============================================================
         // Twitch присылает смайлы строкой вида "25:0-4,12-16/1902:6-10":
         // "/" разделяет разные смайлы, "," — позиции одного смайла.
-        // Библиотеке нужен объект: { "25": ["0-4", "12-16"], "1902": ["6-10"] }
+        // Позиции точные, поэтому смайлы Twitch (включая смайлы канала)
+        // рисуем по ID прямо с CDN Twitch — без сторонних сервисов.
+        function twitchEmoteUrl(id) {
+            return `https://static-cdn.jtvnw.net/emoticons/v2/${id}/default/dark/2.0`;
+        }
+
+        // Собирает позиции смайлов: [{ start, end, id }, ...]
         function parseEmotesTag(emotesTag) {
-            const result = {};
+            const ranges = [];
             for (const part of (emotesTag || '').split('/')) {
-                const [id, ranges] = part.split(':');
-                if (id && ranges) result[id] = ranges.split(',');
+                const [id, list] = part.split(':');
+                if (!id || !list) continue;
+                for (const range of list.split(',')) {
+                    const [start, end] = range.split('-').map(Number);
+                    if (Number.isFinite(start) && Number.isFinite(end)) {
+                        ranges.push({ start, end, id });
+                    }
+                }
             }
-            return result;
+            return ranges.sort((a, b) => a.start - b.start);
+        }
+
+        // Смайлы BTTV, FFZ и 7TV приходят без позиций — их ищем по названию.
+        // Списки качаем один раз при запуске и держим в памяти.
+        const emoteMap = new Map();        // название смайла -> ссылка на картинку
+        const emoteChannels = new Set();   // каналы, для которых загрузка уже начата
+        let emoteSetsLoaded = null;        // промис: завершится, когда всё загружено
+
+        function addEmote(code, url) {
+            if (code && url && !emoteMap.has(code)) emoteMap.set(code, url);
+        }
+
+        function bttvEmoteUrl(id) {
+            return `https://cdn.betterttv.net/emote/${id}/2x`;
+        }
+
+        function ffzEmoteUrl(urls) {
+            return urls['2'] || urls['1'] || urls['4'] || '';
+        }
+
+        // У 7TV картинка лежит на его CDN; берём 2x.webp, иначе что найдётся
+        function seventvEmoteUrl(emote) {
+            const host = emote && emote.data && emote.data.host;
+            if (!host || !host.url) return '';
+            const files = Array.isArray(host.files) ? host.files : [];
+            const preferred = ['2x.webp', '1x.webp', '2x.png', '1x.png', '2x.gif', '1x.gif'];
+            for (const name of preferred) {
+                if (files.some(file => file.name === name)) return `https:${host.url}/${name}`;
+            }
+            const first = files.find(file => /^1x\./.test(file.name)) || files[0];
+            return first ? `https:${host.url}/${first.name}` : `https:${host.url}`;
+        }
+
+        async function loadBttvEmotes(id) {
+            const [global, channel] = await Promise.all([
+                fetchJson('https://api.betterttv.net/3/cached/emotes/global').catch(() => []),
+                id ? fetchJson(`https://api.betterttv.net/3/cached/users/twitch/${id}`).catch(() => null) : null
+            ]);
+            for (const emote of Array.isArray(global) ? global : []) {
+                addEmote(emote.code, bttvEmoteUrl(emote.id));
+            }
+            const own = channel ? [...(channel.channelEmotes || []), ...(channel.sharedEmotes || [])] : [];
+            for (const emote of own) addEmote(emote.code, bttvEmoteUrl(emote.id));
+        }
+
+        async function loadFfzEmotes(id) {
+            const urls = ['https://api.frankerfacez.com/v1/set/global'];
+            if (id) urls.push(`https://api.frankerfacez.com/v1/room/id/${id}`);
+            const answers = await Promise.all(urls.map(url => fetchJson(url).catch(() => null)));
+            for (const data of answers) {
+                for (const set of Object.values((data && data.sets) || {})) {
+                    for (const emote of (set && set.emoticons) || []) {
+                        addEmote(emote.name, ffzEmoteUrl(emote.urls || {}));
+                    }
+                }
+            }
+        }
+
+        async function loadSeventvEmotes(id) {
+            const requests = [fetchJson('https://7tv.io/v3/emote-sets/global').catch(() => null)];
+            if (id) requests.push(fetchJson(`https://7tv.io/v3/users/twitch/${id}`).catch(() => null));
+            const [global, channel] = await Promise.all(requests);
+            const lists = [global && global.emotes, channel && channel.emote_set && channel.emote_set.emotes];
+            for (const list of lists) {
+                for (const emote of Array.isArray(list) ? list : []) {
+                    // zero-width смайлы рисуются поверх соседних — их пропускаем
+                    if ((Number(emote.flags) || 0) & 256) continue;
+                    addEmote(emote.name, seventvEmoteUrl(emote));
+                }
+            }
+        }
+
+        // Запускает загрузку всех включённых сервисов (один раз на канал)
+        function startEmoteLoading(id) {
+            const key = id || '';
+            if (emoteChannels.has(key)) return emoteSetsLoaded || Promise.resolve();
+            emoteChannels.add(key);
+
+            const jobs = [];
+            if (useEmotes.bttv) jobs.push(loadBttvEmotes(id));
+            if (useEmotes.ffz) jobs.push(loadFfzEmotes(id));
+            if (useEmotes.seventv) jobs.push(loadSeventvEmotes(id));
+
+            emoteSetsLoaded = Promise.all(jobs).catch(() => {});
+            return emoteSetsLoaded;
+        }
+
+        function emoteHtml(url, alt) {
+            return `<span class="emotettv-emote"><img class="emotettv-img"`
+                + ` src="${escapeHtml(url)}" alt="${escapeHtml(alt)}" title="${escapeHtml(alt)}"`
+                + ` onerror="this.replaceWith(this.alt)"></span>`;
+        }
+
+        // Обычный текст: каждое слово проверяем по списку сторонних смайлов
+        function renderPlainText(text, map) {
+            return text.split(/(\s+)/).map(token => {
+                if (!token) return '';
+                if (/^\s+$/.test(token)) return escapeHtml(token);
+                const url = map.get(token);
+                return url ? emoteHtml(url, token) : escapeHtml(token);
+            }).join('');
+        }
+
+        // Собирает HTML сообщения: сначала точные позиции Twitch, между ними — слова
+        function buildEmoteHtml(text, emotesTag, map) {
+            const parts = [];
+            let pos = 0;
+
+            for (const range of parseEmotesTag(emotesTag)) {
+                if (range.start < pos || range.start >= text.length) continue;
+                const end = Math.min(range.end, text.length - 1);
+
+                parts.push(renderPlainText(text.slice(pos, range.start), map));
+                const alt = text.slice(range.start, end + 1);
+                parts.push(useEmotes.twitch ? emoteHtml(twitchEmoteUrl(range.id), alt) : escapeHtml(alt));
+                pos = end + 1;
+            }
+
+            parts.push(renderPlainText(text.slice(pos), map));
+            return parts.join('');
         }
 
         // Превращает текст сообщения в HTML со смайлами.
-        // Если CDN не ответил — вернёт null, и сообщение покажется текстом.
-        async function renderEmotes(text, emotesTag, channelId) {
+        // Первое сообщение ждёт списки не дольше 1,2 с: остальное догружается
+        // в фоне и появится у следующих сообщений.
+        async function renderEmotes(text, emotesTag, id) {
             try {
-                const message = await withTimeout(
-                    parseEmotes(text, parseEmotesTag(emotesTag), { providers: useEmotes, channelId }),
-                    requestTimeoutMs
-                );
-                return message.toHTML(1, true, true); // 1 = размер, true = экранировать текст
+                const loading = startEmoteLoading(id || channelId);
+                await withTimeout(loading, Math.min(requestTimeoutMs, 1200)).catch(() => {});
+                return buildEmoteHtml(text, emotesTag, emoteMap);
             } catch (error) {
                 console.warn('Не удалось загрузить смайлы, показываю текст:', error);
                 return null;
@@ -741,28 +856,11 @@
         }
 
         // ============================================================
-        //  ПРОВЕРКА СЕРВИСОВ СМАЙЛОВ
-        // ============================================================
-        // FFZ и 7TV в некоторых регионах недоступны. Если сервис не отвечает,
-        // отключаем его, чтобы каждое сообщение не ждало таймаут.
-        function disableProviderIfUnavailable(name, url, title) {
-            withTimeout(fetch(url), 3000)
-                .then(response => {
-                    if (!response.ok) throw new Error(`HTTP ${response.status}`);
-                })
-                .catch(() => {
-                    useEmotes[name] = false;
-                    console.warn(`${title} недоступен — его смайлы отключены до перезагрузки`);
-                });
-        }
-
-        // ============================================================
         //  ЗАПУСК
         // ============================================================
         loadGlobalBadges(); // заранее грузим значки, чтобы первое сообщение не ждало
         loadModVip();       // роли для цитат ответов (модератор/VIP)
-        disableProviderIfUnavailable('ffz', 'https://api.frankerfacez.com/v1/set/global', 'FFZ');
-        disableProviderIfUnavailable('seventv', 'https://7tv.io/v3/emote-sets/global', '7TV');
+        startEmoteLoading(channelId); // смайлы канала и сервисов — в фоне
         connect();
     </script>
 </body>
